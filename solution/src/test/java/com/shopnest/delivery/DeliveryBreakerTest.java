@@ -1,11 +1,6 @@
 package com.shopnest.delivery;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -15,26 +10,31 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker.State;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
-import org.mockito.stubbing.OngoingStubbing;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.http.MediaType;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
 /**
  * Checks the circuit breaker problem of Class 15 (The Circuit Breaker).
- * The courier is replaced by a mock, so every test decides exactly what the courier does.
+ * The courier is replaced by a small fake class written in this file (ScriptedCourier), so every test decides
+ * exactly what the courier does, and counts the calls that really reach it. There is no Mockito here: only JUnit.
  * "S" in a sequence means the courier answers (3 days), "F" means the courier is down.
  */
 @SpringBootTest
@@ -42,18 +42,68 @@ import org.springframework.test.web.servlet.ResultActions;
 @Timeout(value = 30, unit = TimeUnit.SECONDS)
 class DeliveryBreakerTest {
 
+    /**
+     * The courier of these tests. It does what the test tells it, and it remembers every call that reaches it.
+     * Call 1 gets step 1, call 2 gets step 2 ...; the last step repeats.
+     * A step is a number (the courier answers with that many days) or an exception (the courier fails).
+     */
+    static class ScriptedCourier implements CourierApi {
+
+        private final List<Object> steps = new ArrayList<>();
+        private final List<String> pincodes = new ArrayList<>();
+
+        /** Back to the start: a healthy courier (3 days), and no calls counted. */
+        void reset() {
+            steps.clear();
+            steps.add(3);
+            pincodes.clear();
+        }
+
+        void does(Object... newSteps) {
+            steps.clear();
+            steps.addAll(List.of(newSteps));
+        }
+
+        /** The pincode of every call that reached the courier, in order. */
+        List<String> calls() {
+            return pincodes;
+        }
+
+        @Override
+        public int daysTo(String pincode) {
+            Object step = steps.get(Math.min(pincodes.size(), steps.size() - 1));
+            pincodes.add(pincode);
+            if (step instanceof RuntimeException failure) {
+                throw failure;
+            }
+            return (Integer) step;
+        }
+    }
+
+    /** Puts the fake courier in the place of the pretend courier (@Primary wins when two beans fit CourierApi). */
+    @TestConfiguration
+    static class FakeCourierConfig {
+
+        @Bean
+        @Primary
+        ScriptedCourier scriptedCourier() {
+            return new ScriptedCourier();
+        }
+    }
+
     @Autowired
     private MockMvc mvc;
 
     @Autowired
     private CircuitBreakerRegistry registry;
 
-    @MockitoBean
-    private PretendCourier courier;
+    @Autowired
+    private ScriptedCourier courier;
 
     @BeforeEach
     void startWithAFreshBreaker() {
         breaker().reset();
+        courier.reset();
     }
 
     // ------------------------------------------------------------------
@@ -76,16 +126,15 @@ class DeliveryBreakerTest {
 
     /** What the courier does on call 1, 2, 3 ... ; the last step repeats. */
     private void courierDoes(String sequence) {
-        OngoingStubbing<Integer> stub = null;
-        for (char step : sequence.toCharArray()) {
-            if (stub == null) {
-                stub = step == 'S'
-                        ? when(courier.daysTo(anyString())).thenReturn(3)
-                        : when(courier.daysTo(anyString())).thenThrow(new CourierDownException("down"));
+        Object[] steps = new Object[sequence.length()];
+        for (int i = 0; i < steps.length; i++) {
+            if (sequence.charAt(i) == 'S') {
+                steps[i] = 3;
             } else {
-                stub = step == 'S' ? stub.thenReturn(3) : stub.thenThrow(new CourierDownException("down"));
+                steps[i] = new CourierDownException("down");
             }
         }
+        courier.does(steps);
     }
 
     /** Sends one request per letter of the sequence, with the courier doing exactly that. */
@@ -101,7 +150,7 @@ class DeliveryBreakerTest {
     @Test
     @DisplayName("Task 4: GET /delivery/{pincode} gives the courier's answer as JSON")
     void endpointGivesTheCouriersAnswer() throws Exception {
-        when(courier.daysTo("560001")).thenReturn(2);
+        courier.does(2);
 
         ask("560001")
                 .andExpect(status().isOk())
@@ -109,19 +158,20 @@ class DeliveryBreakerTest {
                 .andExpect(jsonPath("$.pincode").value("560001"))
                 .andExpect(jsonPath("$.days").value(2))
                 .andExpect(jsonPath("$.source").value("courier"));
+        assertThat(courier.calls()).as("the pincode that reached the courier").containsExactly("560001");
     }
 
     @Test
     @DisplayName("Task 4: another pincode and another answer (no fixed answers)")
     void endpointUsesThePincodeAndTheDays() throws Exception {
-        when(courier.daysTo("110011")).thenReturn(7);
+        courier.does(7);
 
         ask("110011")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.pincode").value("110011"))
                 .andExpect(jsonPath("$.days").value(7))
                 .andExpect(jsonPath("$.source").value("courier"));
-        verify(courier).daysTo("110011");
+        assertThat(courier.calls()).as("the pincode that reached the courier").containsExactly("110011");
     }
 
     // ------------------------------------------------------------------
@@ -140,10 +190,14 @@ class DeliveryBreakerTest {
                 .andExpect(jsonPath("$.source").value("default"));
     }
 
+    static Stream<RuntimeException> failures() {
+        return Stream.of(new IllegalStateException("boom"), new NullPointerException("boom"), new RuntimeException("boom"));
+    }
+
     @ParameterizedTest(name = "Task 3: any failure of the courier is covered ({0})")
-    @ValueSource(classes = {IllegalStateException.class, NullPointerException.class, RuntimeException.class})
-    void anyFailureGivesTheSimpleAnswer(Class<? extends RuntimeException> failure) throws Exception {
-        when(courier.daysTo(anyString())).thenThrow(failure);
+    @MethodSource("failures")
+    void anyFailureGivesTheSimpleAnswer(RuntimeException failure) throws Exception {
+        courier.does(failure);
 
         ask("560001")
                 .andExpect(status().isOk())
@@ -154,7 +208,7 @@ class DeliveryBreakerTest {
     @Test
     @DisplayName("Task 3: a healthy courier is never replaced by the simple answer")
     void aHealthyCourierIsNotReplaced() throws Exception {
-        when(courier.daysTo(anyString())).thenReturn(9);
+        courier.does(9);
 
         ask("400001")
                 .andExpect(jsonPath("$.days").value(9))
@@ -165,13 +219,13 @@ class DeliveryBreakerTest {
     @DisplayName("Task 3: when the breaker is OPEN the customer still gets the simple answer, and the courier is not called")
     void openBreakerStillAnswers() throws Exception {
         breaker().transitionToOpenState();
-        when(courier.daysTo(anyString())).thenReturn(3);
+        courier.does(3);
 
         ask("400001")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.days").value(5))
                 .andExpect(jsonPath("$.source").value("default"));
-        verify(courier, never()).daysTo(anyString());
+        assertThat(courier.calls()).as("calls that reached the courier").isEmpty();
     }
 
     // ------------------------------------------------------------------
@@ -209,7 +263,7 @@ class DeliveryBreakerTest {
         askTimes(6);
 
         assertThat(breaker().getState()).isEqualTo(State.OPEN);
-        verify(courier, times(4)).daysTo(anyString());
+        assertThat(courier.calls()).as("calls that reached the courier").hasSize(4);
     }
 
     @Test
@@ -275,9 +329,9 @@ class DeliveryBreakerTest {
         runSequence("SSSF");
 
         assertThat(breaker().getState()).isEqualTo(State.CLOSED);
-        verify(courier, times(4)).daysTo(anyString());
+        assertThat(courier.calls()).as("calls that reached the courier").hasSize(4);
         askTimes(1);
-        verify(courier, times(5)).daysTo(anyString());
+        assertThat(courier.calls()).as("calls that reached the courier").hasSize(5);
     }
 
     @Test
@@ -295,7 +349,7 @@ class DeliveryBreakerTest {
         runSequence("FSSSFSSSF");
 
         assertThat(breaker().getState()).isEqualTo(State.CLOSED);
-        verify(courier, times(9)).daysTo(anyString());
+        assertThat(courier.calls()).as("calls that reached the courier").hasSize(9);
     }
 
     // ------------------------------------------------------------------

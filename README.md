@@ -64,7 +64,7 @@ To achieve these requirements we need to do 4 things:
 ## Instructions
 1. There is one TODO note in each of these four files: `application.properties` (`TODO 1`), `CourierClient.java` (`TODO 2`), `DeliveryService.java` (`TODO 3`) and `DeliveryController.java` (`TODO 4`).
 2. Do not modify the other files (they are finished), the dependencies in `pom.xml` (they are the same three as in class: the actuator, AspectJ and Resilience4j), the names of the classes and methods, or the dependencies that are injected in the classes. Feel free to add new methods or imports if required.
-3. Start the application (`mvn spring-boot:run`, or run `DeliveryApplication` in your IDE). It runs on port 8080. Then try these commands in a second terminal, and compare with the answers below. When all four tasks are finished, you should see exactly this:
+3. Start the application (`mvn spring-boot:run`, or run `DeliveryApplication` in your IDE). It runs on port 8080 (if that port is busy, stop the other application that uses it, for example the project from class). Then try these commands in a second terminal, and compare with the answers below. When all four tasks are finished, you should see exactly this:
    ```
    $ curl localhost:8080/delivery/400001
    {"pincode":"400001","days":3,"source":"courier"}
@@ -90,7 +90,7 @@ To achieve these requirements we need to do 4 things:
    ```
    After these two calls, `curl localhost:8080/actuator/circuitbreakers` shows `"state":"CLOSED"`.
 
-   Before you start, the application already runs: `curl localhost:8080/delivery/400001` gives an empty `404` (there is no endpoint yet), and `curl localhost:8080/actuator/circuitbreakers` gives `{"circuitBreakers":{}}`.
+   Before you start, the application already runs: `curl localhost:8080/delivery/400001` gives a `404` Not Found error (there is no endpoint yet), and `curl localhost:8080/actuator/circuitbreakers` gives `{"circuitBreakers":{}}`.
 4. Your code will be checked with the test file `src/test/java/com/shopnest/delivery/DeliveryBreakerTest.java`. It checks the cases in the Requirements above, and the rules. While you write your code, use the commands in instruction 3 to check your work.
 5. You do not need a database, the internet or a key. It works with Java 17 and Maven, like the project from class.
 6. Hints (all of these use ideas from class):
